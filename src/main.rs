@@ -6,6 +6,7 @@ use clap::Parser;
 use regex::Regex;
 use anyhow::{Result, anyhow};
 use lazy_static::lazy_static;
+use std::collections::BTreeMap;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,11 +145,20 @@ fn is_in_intergenic(pos: usize, chr: &str, gene_regions: &GeneRegions) -> bool {
         match regions.binary_search_by_key(&pos, |r| r.start) {
             Ok(_) => false, // 在基因起始位置
             Err(i) => {
+                // 检查前一个基因
                 if i > 0 && pos <= regions[i-1].end {
-                    false // 在基因内部
-                } else {
-                    true // 在基因间区
+                    return false;
                 }
+                // 检查当前基因（如果存在）
+                if i < regions.len() && pos >= regions[i].start && pos <= regions[i].end {
+                    return false;
+                }
+                // 检查是否在安全距离内
+                let safe_distance = 1000; // 1kb安全距离
+                if i < regions.len() && pos >= regions[i].start.saturating_sub(safe_distance) {
+                    return false;
+                }
+                true
             }
         }
     } else {
@@ -222,7 +232,8 @@ fn find_best_split_position(
 }
 
 fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
-    let mut reg: HashMap<String, HashMap<String, HashMap<String, bool>>> = HashMap::new();
+    // 使用BTreeMap来保证染色体的字典序
+    let mut reg: BTreeMap<String, BTreeMap<usize, usize>> = BTreeMap::new();
     
     // 读取区域信息
     let file = File::open(region)?;
@@ -234,11 +245,12 @@ fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
             continue;
         }
         let (chr, s, e) = (parts[0], parts[1], parts[2]);
+        let start: usize = s.parse()?;
+        let end: usize = e.parse()?;
+        
         reg.entry(chr.to_string())
-            .or_default()
-            .entry(s.to_string())
-            .or_default()
-            .insert(e.to_string(), true);
+           .or_default()
+           .insert(start, end);
     }
 
     // 处理GXF文件
@@ -266,27 +278,22 @@ fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
         let rest = parts[5..].join("\t");
 
         if let Some(chr_regions) = reg.get(chr) {
-            for (s, e_map) in chr_regions.iter() {
-                for e in e_map.keys() {
-                    let s: usize = s.parse()?;
-                    let e: usize = e.parse()?;
-                    
-                    if e < start || s > end {
-                        continue;
-                    }
-                    if end > e {
-                        return Err(anyhow!("feature splitted into diff region {}:{}-{}:\n{}", chr, s, e, line));
-                    }
+            for (&s, &e) in chr_regions.iter() {
+                if e < start || s > end {
+                    continue;
+                }
+                if end > e {
+                    return Err(anyhow!("feature splitted into diff region {}:{}-{}:\n{}", chr, s, e, line));
+                }
 
-                    let new_s = start - s + 1;
-                    let new_e = end - s + 1;
+                let new_s = start - s + 1;
+                let new_e = end - s + 1;
 
-                    if chr_regions.len() == 1 {
-                        writeln!(out_file, "{}\t{}\t{}\t{}\t{}\t{}", chr, source, type_, new_s, new_e, rest)?;
-                    } else {
-                        writeln!(out_file, "{}_{}_{}\t{}\t{}\t{}\t{}\t{}", 
-                            chr, s, e, source, type_, new_s, new_e, rest)?;
-                    }
+                if reg[chr].len() == 1 {
+                    writeln!(out_file, "{}\t{}\t{}\t{}\t{}\t{}", chr, source, type_, new_s, new_e, rest)?;
+                } else {
+                    writeln!(out_file, "{}_{}_{}\t{}\t{}\t{}\t{}\t{}", 
+                        chr, s, e, source, type_, new_s, new_e, rest)?;
                 }
             }
         }
