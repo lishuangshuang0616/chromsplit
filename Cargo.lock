@@ -190,6 +190,7 @@ dependencies = [
  "anyhow",
  "bio",
  "clap",
+ "lazy_static",
  "regex",
 ]
 

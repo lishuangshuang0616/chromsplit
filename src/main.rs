@@ -1,10 +1,11 @@
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, BufWriter};
 use std::path::Path;
 use std::collections::HashMap;
 use clap::Parser;
 use regex::Regex;
 use anyhow::{Result, anyhow};
+use lazy_static::lazy_static;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,10 +68,12 @@ fn process_fragment(
     let start_position = start_position + 1;
     let end = end + 1;
 
-    let mut out_fa = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(format!("{}.fa", outpref))?;
+    let mut out_fa = BufWriter::new(
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}.fa", outpref))?
+    );
 
     if real_len == length {
         writeln!(out_fa, ">{}", id)?;
@@ -138,16 +141,23 @@ fn get_gene_regions(gxf_file: Option<&str>) -> Result<GeneRegions> {
 
 fn is_in_intergenic(pos: usize, chr: &str, gene_regions: &GeneRegions) -> bool {
     if let Some(regions) = gene_regions.get(chr) {
-        for region in regions {
-            if pos >= region.start && pos <= region.end {
-                return false;
-            }
-            if pos < region.start {
-                return true;
+        match regions.binary_search_by_key(&pos, |r| r.start) {
+            Ok(_) => false, // 在基因起始位置
+            Err(i) => {
+                if i > 0 && pos <= regions[i-1].end {
+                    false // 在基因内部
+                } else {
+                    true // 在基因间区
+                }
             }
         }
+    } else {
+        true
     }
-    true
+}
+
+lazy_static! {
+    static ref N_PATTERN: Regex = Regex::new(r"N{10,}").unwrap();
 }
 
 fn find_best_split_position(
@@ -155,7 +165,6 @@ fn find_best_split_position(
     current_position: usize,
     min_fragment_length: usize,
     max_fragment_length: usize,
-    num_n: usize,
     chr: &str,
     gene_regions: &GeneRegions,
 ) -> Result<Option<(usize, usize)>> {
@@ -166,12 +175,8 @@ fn find_best_split_position(
         return Ok(None);
     }
 
-    // 创建N序列的正则表达式模式
-    let n_pattern = format!(r"N{{{},}}", num_n);
-    let re = Regex::new(&n_pattern)?;
-
     // 在N序列处查找分割点
-    for cap in re.find_iter(&genome_sequence[current_position..]) {
+    for cap in N_PATTERN.find_iter(&genome_sequence[current_position..]) {
         let match_start = current_position + cap.start();
         let fragment_length = match_start - current_position;
 
@@ -190,10 +195,11 @@ fn find_best_split_position(
 
     // 在基因间区寻找合适的分割点
     let target_pos = current_position + max_fragment_length;
-    let window_size = 50000;
+    let forward_window_size = 500000;
+    let backward_window_size = 10000;
 
     // 向前查找
-    for pos in (current_position.max(target_pos.saturating_sub(window_size))..=target_pos).rev() {
+    for pos in (current_position.max(target_pos.saturating_sub(forward_window_size))..=target_pos).rev() {
         if is_in_intergenic(pos, chr, gene_regions) {
             let fragment_length = pos - current_position;
             if min_fragment_length <= fragment_length && fragment_length <= max_fragment_length {
@@ -203,7 +209,7 @@ fn find_best_split_position(
     }
 
     // 向后查找
-    for pos in target_pos..=(target_pos + window_size).min(genome_sequence.len()) {
+    for pos in target_pos..=(target_pos + backward_window_size).min(genome_sequence.len()) {
         if is_in_intergenic(pos, chr, gene_regions) {
             let fragment_length = pos - current_position;
             if min_fragment_length <= fragment_length && fragment_length <= (max_fragment_length as f64 * 1.1) as usize {
@@ -327,7 +333,6 @@ fn main() -> Result<()> {
                 current_position,
                 args.min_length,
                 args.max_length,
-                args.num_n,
                 id,
                 &gene_regions,
             )? {
