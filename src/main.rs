@@ -41,11 +41,11 @@ struct Args {
     num_n: usize,
 
     /// Minimum length of output scaffold fragments (in base pairs)
-    #[arg(long = "min_length", default_value = "300000000")]
+    #[arg(long = "min_length", default_value = "300_000_000")]
     min_length: usize,
 
     /// Maximum length of output scaffold fragments (in base pairs)
-    #[arg(long = "max_length", default_value = "500000000")]
+    #[arg(long = "max_length", default_value = "500_000_000")]
     max_length: usize,
 }
 
