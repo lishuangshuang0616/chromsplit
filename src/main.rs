@@ -48,13 +48,14 @@ struct Args {
     max_length: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GeneRegion {
     start: usize,
     end: usize,
 }
 
-type GeneRegions = HashMap<String, Vec<GeneRegion>>;
+/// 染色体上所有基因区域（已排序且合并重叠区域）
+type MergedGeneRegions = HashMap<String, Vec<GeneRegion>>;
 
 fn process_fragment(
     id: &str,
@@ -96,12 +97,12 @@ fn process_fragment(
     Ok(())
 }
 
-/// Read gene region information from GXF file (GTF/GFF)
+/// 处理GTF/GFF文件，提取基因区域并合并重叠区域
 /// 
-/// This function parses the GXF file, extracts gene and exon position information, and organizes by chromosome
-/// Returns a data structure indexed by chromosome name containing gene regions
-fn get_gene_regions(gxf_file: Option<&str>) -> Result<GeneRegions> {
-    let mut gene_regions = HashMap::new();
+/// 此函数解析GTF/GFF文件，提取基因和外显子位置信息，合并重叠区域，并根据染色体组织
+/// 返回按染色体名称索引的包含已合并基因区域的数据结构
+fn get_merged_gene_regions(gxf_file: Option<&str>) -> Result<MergedGeneRegions> {
+    let mut gene_regions: HashMap<String, Vec<GeneRegion>> = HashMap::new();
     
     let Some(gxf_path) = gxf_file else {
         return Ok(gene_regions);
@@ -109,16 +110,14 @@ fn get_gene_regions(gxf_file: Option<&str>) -> Result<GeneRegions> {
 
     eprintln!("Reading gene annotation file: {}", gxf_path);
     let file = File::open(gxf_path)?;
-    let reader = BufReader::with_capacity(1024 * 1024, file); // Using 1MB buffer to improve reading performance
+    let reader = BufReader::with_capacity(1024 * 1024, file); // 使用1MB缓冲区提高读取性能
 
+    let mut raw_regions: HashMap<String, Vec<GeneRegion>> = HashMap::new();
     let mut line_count = 0;
     let mut feature_count = 0;
     let mut skipped_count = 0;
     
-    // Pre-allocate a reasonable size vector to reduce reallocation
-    let mut chr_capacity: HashMap<String, usize> = HashMap::new();
-
-    // First scan, count the number of features on each chromosome
+    // 第一遍扫描，收集所有基因和外显子区域
     for line in reader.lines() {
         let line = line?;
         line_count += 1;
@@ -139,120 +138,155 @@ fn get_gene_regions(gxf_file: Option<&str>) -> Result<GeneRegions> {
 
         let chr = fields[0].to_string();
         let type_ = fields[2].to_lowercase();
-        if !["gene", "exon"].contains(&type_.as_str()) {
-            continue;
-        }
-        
-        *chr_capacity.entry(chr).or_insert(0) += 1;
-        feature_count += 1;
-    }
-    
-    eprintln!("First scan completed: total {} lines, {} chromosomes, {} features, skipped {} lines", 
-              line_count, chr_capacity.len(), feature_count, skipped_count);
-    
-    // Pre-allocate vector capacity for each chromosome
-    for (chr, count) in &chr_capacity {
-        gene_regions.insert(chr.clone(), Vec::with_capacity(*count));
-    }
-    
-    // Second scan, actually read features
-    let file = File::open(gxf_path)?;
-    let reader = BufReader::with_capacity(1024 * 1024, file);
-    line_count = 0;
-    feature_count = 0;
-    
-    for line in reader.lines() {
-        let line = line?;
-        line_count += 1;
-        
-        if line_count % 1000000 == 0 {
-            eprintln!("Processed {} lines", line_count);
-        }
-        
-        if line.starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 9 {
-            continue;
-        }
-
-        let chr = fields[0].to_string();
-        let type_ = fields[2].to_lowercase();
-        if !["gene", "exon"].contains(&type_.as_str()) {
+        if !["gene"].contains(&type_.as_str()) {
             continue;
         }
 
         let start: usize = fields[3].parse()?;
         let end: usize = fields[4].parse()?;
 
-        gene_regions.entry(chr)
+        raw_regions.entry(chr)
             .or_insert_with(Vec::new)
             .push(GeneRegion { start, end });
             
         feature_count += 1;
     }
-
-    // Sort regions for each chromosome
-    for regions in gene_regions.values_mut() {
-        regions.sort_by_key(|r| r.start);
+    
+    eprintln!("Initial scan completed: processed {} features, {} chromosomes, skipped {} lines", 
+              feature_count, raw_regions.len(), skipped_count);
+    
+    // 对每条染色体的基因区域进行排序和合并
+    for (chr, regions) in raw_regions {
+        if regions.is_empty() {
+            continue;
+        }
+        
+        // 按起始位置排序
+        let mut sorted_regions = regions;
+        sorted_regions.sort_by_key(|r| r.start);
+        
+        // 合并重叠区域
+        let mut merged_regions = Vec::new();
+        let mut current = sorted_regions[0].clone();
+        
+        for region in sorted_regions.iter().skip(1) {
+            // 如果当前区域与前一个区域重叠或相邻，则合并
+            if region.start <= current.end + 1 {
+                // 扩展当前区域
+                current.end = current.end.max(region.end);
+            } else {
+                // 没有重叠，将当前区域添加到结果中并开始新区域
+                merged_regions.push(current);
+                current = region.clone();
+            }
+        }
+        // 添加最后一个区域
+        merged_regions.push(current);
+        
+        eprintln!("Chromosome {}: merged {} raw regions into {} non-overlapping regions", 
+                 chr, sorted_regions.len(), merged_regions.len());
+        
+        gene_regions.insert(chr, merged_regions);
     }
     
-    eprintln!("Gene region reading completed: processed {} features, {} chromosomes", feature_count, gene_regions.len());
+    eprintln!("Gene region processing completed: merged regions for {} chromosomes", gene_regions.len());
 
     Ok(gene_regions)
 }
 
-/// Determine if a given position is in an intergenic region
+/// 判断给定位置是否在基因间区域
 /// 
-/// This function uses binary search to quickly locate the position and checks if it is within or near any gene region
-/// If the chromosome has no gene annotations, all positions are considered intergenic regions
-fn is_in_intergenic(pos: usize, chr: &str, gene_regions: &GeneRegions) -> bool {
+/// 此函数使用二分查找快速找到位置是否落在任何基因区域之间
+/// 如果染色体没有基因注释，所有位置都被视为基因间区域
+fn is_in_intergenic(pos: usize, chr: &str, gene_regions: &MergedGeneRegions) -> bool {
     if let Some(regions) = gene_regions.get(chr) {
-        // If there are no gene regions, consider it intergenic
+        // 如果没有基因区域，视为基因间区域
         if regions.is_empty() {
             return true;
         }
         
-        // 使用二分查找快速定位位置
-        match regions.binary_search_by_key(&pos, |r| r.start) {
-            Ok(_) => false, // At gene start position
-            Err(i) => {
-                // Check previous gene - if position is within range of previous gene, it's not intergenic
-                if i > 0 && pos <= regions[i-1].end {
-                    return false;
-                }
-                
-                // Check current gene (if exists) - if position is within range of current gene, it's not intergenic
-                if i < regions.len() && pos >= regions[i].start && pos <= regions[i].end {
-                    return false;
-                }
-                
-                // Check if within safe distance - increase safe distance to avoid cutting important regulatory regions near genes
-                let safe_distance = 5000; // Increased to 5kb safe distance
-                
-                // Check distance to the next gene
-                if i < regions.len() && pos >= regions[i].start.saturating_sub(safe_distance) {
-                    return false;
-                }
-                
-                // Check distance to the previous gene
-                if i > 0 && pos <= regions[i-1].end + safe_distance {
-                    return false;
-                }
-                
-                // Passed all checks, confirmed as intergenic region
-                true
-            }
+        // 检查是否在第一个基因之前
+        if pos < regions[0].start {
+            return true;
+        }
+        
+        // 检查是否在最后一个基因之后
+        if pos > regions.last().unwrap().end {
+            return true;
+        }
+        
+        // 二分查找找到pos所在的区间
+        let idx = match regions.binary_search_by(|r| {
+            if pos < r.start { std::cmp::Ordering::Greater }
+            else if pos > r.end { std::cmp::Ordering::Less }
+            else { std::cmp::Ordering::Equal }
+        }) {
+            Ok(_) => return false, // 位于基因区域内
+            Err(i) => i,
+        };
+        
+        // 检查位置是否在两个基因区域之间
+        // 由于合并了重叠区域，只需检查是否在上一个区域之后且在下一个区域之前
+        if idx > 0 && idx < regions.len() {
+            return pos > regions[idx-1].end && pos < regions[idx].start;
+        } else if idx == 0 {
+            // 在第一个基因之前
+            return pos < regions[0].start;
+        } else {
+            // 在最后一个基因之后
+            return pos > regions.last().unwrap().end;
         }
     } else {
-        // If chromosome has no gene annotations, consider all positions as intergenic regions
+        // 如果染色体没有基因注释，所有位置都视为基因间区域
         true
     }
 }
 
-// Use dynamically created regular expression based on user-specified N length
+/// 找到离给定位置最近的基因间区域
+/// 
+/// 从目标位置开始向前和向后搜索，找到最近的基因间区域
+/// 返回找到的基因间区域位置
+fn find_nearest_intergenic_region(
+    pos: usize, 
+    chr: &str, 
+    gene_regions: &MergedGeneRegions,
+    max_search_distance: usize
+) -> Option<usize> {
+    if let Some(regions) = gene_regions.get(chr) {
+        if regions.is_empty() {
+            return Some(pos); // 如果没有基因，当前位置就是基因间区域
+        }
+        
+        // 如果当前位置已经是基因间区域，直接返回
+        if is_in_intergenic(pos, chr, gene_regions) {
+            return Some(pos);
+        }
+        
+        // 向前和向后搜索
+        for offset in 1..=max_search_distance {
+            // 向前搜索
+            if pos > offset {
+                let backward_pos = pos - offset;
+                if is_in_intergenic(backward_pos, chr, gene_regions) {
+                    return Some(backward_pos);
+                }
+            }
+            
+            // 向后搜索
+            let forward_pos = pos + offset;
+            if is_in_intergenic(forward_pos, chr, gene_regions) {
+                return Some(forward_pos);
+            }
+        }
+    } else {
+        // 如果染色体没有基因注释，所有位置都是基因间区域
+        return Some(pos);
+    }
+    
+    None // 没有找到合适的基因间区域
+}
+
+// 创建基于用户指定的N长度的正则表达式
 fn create_n_pattern(num_n: usize) -> Regex {
     Regex::new(&format!(r"N{{{},}}", num_n)).unwrap()
 }
@@ -263,7 +297,7 @@ fn find_best_split_position(
     min_fragment_length: usize,
     max_fragment_length: usize,
     chr: &str,
-    gene_regions: &GeneRegions,
+    gene_regions: &MergedGeneRegions,
     n_pattern: &Regex,
 ) -> Result<Option<(usize, usize)>> {
     let total_length = genome_sequence.len();
@@ -273,7 +307,7 @@ fn find_best_split_position(
         return Ok(None);
     }
 
-    // Find split points at N sequences - this is usually the best choice
+    // 在N序列处寻找分割点 - 这通常是最佳选择
     for cap in n_pattern.find_iter(&genome_sequence[current_position..]) {
         let match_start = current_position + cap.start();
         let fragment_length = match_start - current_position;
@@ -287,100 +321,40 @@ fn find_best_split_position(
         }
 
         if is_in_intergenic(match_start, chr, gene_regions) {
-            eprintln!("Found suitable N-stretch split point at {}:{}", chr, match_start);
+            eprintln!("Found suitable N-region split point at {}:{}", chr, match_start);
             return Ok(Some((match_start, fragment_length)));
         }
     }
 
-    // Find suitable split points in intergenic regions
+    // 在基因间区域寻找合适的分割点
     let target_pos = current_position + max_fragment_length;
-    // 增加查找窗口大小以提高找到合适分割点的概率
-    let forward_window_size = 10000000; // 增加到10Mb
-    let backward_window_size = 5000000; // 增加到5Mb
-
     eprintln!("Searching for intergenic split point near target position {}:{}", chr, target_pos);
     
-    // Search forward - prioritize finding before target position
-    let forward_start = current_position.max(target_pos.saturating_sub(forward_window_size));
-    eprintln!("Searching forward from {} to {}", forward_start, target_pos);
-    
-    for pos in (forward_start..=target_pos).rev() {
-        let is_intergenic = is_in_intergenic(pos, chr, gene_regions);
-        if pos % 1000000 == 0 {
-            eprintln!("Checking position {}: intergenic = {}", pos, is_intergenic);
-        }
-        if is_intergenic {
-            let fragment_length = pos - current_position;
-            if min_fragment_length <= fragment_length && fragment_length <= max_fragment_length {
-                eprintln!("Found suitable forward intergenic split point at {}:{}", chr, pos);
-                return Ok(Some((pos, fragment_length)));
-            }
-        }
-    }
-
-    // Search backward
-    let backward_end = (target_pos + backward_window_size).min(genome_sequence.len());
-    eprintln!("Searching backward from {} to {}", target_pos, backward_end);
-    
-    for pos in target_pos..=backward_end {
-        if pos % 1000000 == 0 {
-            eprintln!("Checking position {}", pos);
-        }
-        if is_in_intergenic(pos, chr, gene_regions) {
-            let fragment_length = pos - current_position;
-            // Allow slightly longer fragments when searching backward
-            if min_fragment_length <= fragment_length && fragment_length <= (max_fragment_length as f64 * 1.2) as usize {
-                eprintln!("Found suitable backward intergenic split point at {}:{}", chr, pos);
-                return Ok(Some((pos, fragment_length)));
-            }
-        }
-    }
-
-    // 如果找不到合适的基因间区，尝试找到最接近目标位置且距离基因最远的位置
-    eprintln!("No suitable intergenic region found, searching for optimal fallback position");
-    let mut best_fallback_pos = target_pos;
-    let mut max_distance_to_gene = 0;
-    let fallback_search_range = 2000000; // 增加到2Mb
-    
-    // 在目标位置附近搜索最佳切割点
-    for offset in 0..fallback_search_range {
-        // 向前搜索
-        if target_pos > offset {
-            let pos = target_pos - offset;
-            let distance = find_distance_to_nearest_gene(pos, chr, gene_regions);
-            if distance > max_distance_to_gene {
-                max_distance_to_gene = distance;
-                best_fallback_pos = pos;
-                if pos % 100000 == 0 {
-                    eprintln!("New best fallback position: {}:{} (distance: {}bp)", chr, pos, distance);
-                }
-            }
-        }
+    // 查找最接近目标位置的基因间区域
+    let max_search_distance = 10000000; // 10 Mb搜索窗口
+    if let Some(intergenic_pos) = find_nearest_intergenic_region(target_pos, chr, gene_regions, max_search_distance) {
+        let fragment_length = intergenic_pos - current_position;
         
-        // 向后搜索
-        let pos = target_pos + offset;
-        if pos < genome_sequence.len() {
-            let distance = find_distance_to_nearest_gene(pos, chr, gene_regions);
-            if distance > max_distance_to_gene {
-                max_distance_to_gene = distance;
-                best_fallback_pos = pos;
-                if pos % 100000 == 0 {
-                    eprintln!("New best fallback position: {}:{} (distance: {}bp)", chr, pos, distance);
-                }
-            }
+        // 检查片段长度是否在允许范围内
+        if min_fragment_length <= fragment_length && fragment_length <= (max_fragment_length as f64 * 1.2) as usize {
+            eprintln!("Found suitable intergenic split point at {}:{}", chr, intergenic_pos);
+            return Ok(Some((intergenic_pos, fragment_length)));
+        } else {
+            eprintln!("Found intergenic region at {}:{}, but fragment length {} doesn't meet requirements", 
+                     chr, intergenic_pos, fragment_length);
         }
     }
-    
-    let fallback_pos = best_fallback_pos;
+
+    // 如果无法找到合适的分割点，使用接近目标位置的强制分割点
+    let fallback_pos = target_pos;
     let fallback_length = fallback_pos - current_position;
     
     if fallback_length >= min_fragment_length {
-        eprintln!("Using fallback split position at {}:{} (distance to nearest gene: {}bp)", 
-                 chr, fallback_pos, max_distance_to_gene);
+        eprintln!("Using forced split point at {}:{} (Note: may split gene regions)", chr, fallback_pos);
         return Ok(Some((fallback_pos, fallback_length)));
     }
 
-    Err(anyhow!("Unable to find suitable split position near {}:{}", chr, target_pos))
+    Err(anyhow!("Failed to find suitable split position near {}:{}", chr, target_pos))
 }
 
 fn process_chromosome(
@@ -389,7 +363,7 @@ fn process_chromosome(
     outpref: &str,
     min_fragment_length: usize,
     max_fragment_length: usize,
-    gene_regions: &GeneRegions,
+    gene_regions: &MergedGeneRegions,
     n_pattern: &Regex,
 ) -> Result<()> {
     let mut current_position = 0;
@@ -425,17 +399,17 @@ fn process_chromosome(
     Ok(())
 }
 
-/// Process GXF file (GTF/GFF), adjust gene annotation coordinates based on split regions
+/// 处理GXF文件（GTF/GFF），根据分割区域调整基因注释坐标
 /// 
-/// This function reads split position information, then processes the GXF file, adjusting gene annotation coordinates relative to the split sequences
-/// It maintains chromosome order, ensuring annotations in the output file maintain the same order as the input
+/// 此函数读取分割位置信息，然后处理GXF文件，调整基因注释坐标使其相对于分割序列
+/// 它保持染色体顺序，确保输出文件中的注释维持与输入相同的顺序
 fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
-    // Use BTreeMap to ensure chromosomes are in dictionary order
+    // 使用BTreeMap确保染色体按字典顺序排序
     let mut reg: BTreeMap<String, BTreeMap<usize, usize>> = BTreeMap::new();
     
-    // Read region information - use larger buffer to improve reading performance
+    // 读取区域信息 - 使用更大的缓冲区来提高读取性能
     let file = File::open(region)?;
-    let reader = BufReader::with_capacity(1024 * 1024, file); // 1MB buffer
+    let reader = BufReader::with_capacity(1024 * 1024, file); // 1MB缓冲区
     
     eprintln!("Reading split position information...");
     for line in reader.lines() {
@@ -454,12 +428,12 @@ fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
     }
     eprintln!("Read split positions for {} chromosomes", reg.len());
 
-    // Process GXF file - use larger buffer to improve read/write performance
+    // 处理GXF文件 - 使用更大的缓冲区来提高读/写性能
     let in_file = File::open(ingxf)?;
-    let reader = BufReader::with_capacity(1024 * 1024, in_file); // 1MB buffer
-    let mut out_file = BufWriter::with_capacity(1024 * 1024, File::create(outgxf)?); // 1MB buffer
+    let reader = BufReader::with_capacity(1024 * 1024, in_file); // 1MB缓冲区
+    let mut out_file = BufWriter::with_capacity(1024 * 1024, File::create(outgxf)?); // 1MB缓冲区
 
-    // Pre-allocate sufficient capacity to reduce reallocation
+    // 预分配足够的容量以减少重新分配
     let mut processed_count = 0;
     let mut skipped_count = 0;
     
@@ -487,33 +461,33 @@ fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
         let mut found = false;
         if let Some(chr_regions) = reg.get(chr) {
             for (&s, &e) in chr_regions.iter() {
-                // Check if feature is within current region
+                // 检查特征是否在当前区域内
                 if e < start || s > end {
                     continue;
                 }
                 
-                // Check if feature crosses region boundary
+                // 检查特征是否跨越区域边界
                 if end > e {
                     return Err(anyhow!("Feature crosses split region boundary {}:{}-{}:\n{}", chr, s, e, line));
                 }
 
-                // Calculate new coordinates (relative to split sequence)
+                // 计算新坐标（相对于分割序列）
                 let new_s = start - s + 1;
                 let new_e = end - s + 1;
 
-                // Choose different output format based on whether chromosome is split
-                if reg[chr].len() == 1 {
-                    // Chromosome not split, keep original chromosome name
+                // 根据染色体是否被分割选择不同的输出格式
+                if chr_regions.len() == 1 {
+                    // 染色体未分割，保持原始染色体名称
                     writeln!(out_file, "{}\t{}\t{}\t{}\t{}\t{}", chr, source, type_, new_s, new_e, rest)?;
                 } else {
-                    // Chromosome split, use new naming format
+                    // 染色体已分割，使用新的命名格式
                     writeln!(out_file, "{}_{}_{}	{}	{}	{}	{}	{}", 
                         chr, s, e, source, type_, new_s, new_e, rest)?;
                 }
                 
                 found = true;
                 processed_count += 1;
-                break; // No need to continue checking after finding matching region
+                break; // 找到匹配区域后无需继续检查
             }
         }
         
@@ -521,7 +495,7 @@ fn process_gxf(ingxf: &str, region: &str, outgxf: &str) -> Result<()> {
             skipped_count += 1;
         }
         
-        // Periodically report progress
+        // 定期报告进度
         if (processed_count + skipped_count) % 100000 == 0 {
             eprintln!("Processed {} annotation records, skipped {}", processed_count, skipped_count);
         }
@@ -535,10 +509,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.max_length <= args.min_length {
-        return Err(anyhow!("maxlen must be greater than minlen"));
+        return Err(anyhow!("Maximum length must be greater than minimum length"));
     }
 
-    // Delete existing output files
+    // 删除现有的输出文件
     for ext in &[".fa", ".cutsite.tsv"] {
         let path = format!("{}{}", args.prefix, ext);
         if Path::new(&path).exists() {
@@ -546,49 +520,49 @@ fn main() -> Result<()> {
         }
     }
 
-    // Read gene position information
-    let gene_regions = get_gene_regions(args.gtf.as_deref())?;
+    // 读取并处理基因位置信息，合并重叠区域
+    let gene_regions = get_merged_gene_regions(args.gtf.as_deref())?;
     
-    // Create N sequence pattern
+    // 创建N序列模式
     let n_pattern = create_n_pattern(args.num_n);
     
-    // Open FASTA file for streaming processing, rather than reading all at once into memory
+    // 打开FASTA文件进行流式处理，而不是一次性读入内存
     let file = File::open(&args.fa)?;
     let reader = BufReader::new(file);
     
-    // Use BTreeMap to ensure chromosome order
+    // 使用BTreeMap确保染色体顺序
     let mut current_id = String::new();
     let mut current_sequence = String::new();
     
-    // Use ordered chromosome collection to preserve original order
+    // 使用有序染色体集合来保持原始顺序
     let mut chrom_order = Vec::new();
     
     for line in reader.lines() {
         let line = line?;
         
         if line.starts_with('>') {
-            // Process previous sequence (if any)
+            // 处理前一个序列（如果有）
             if !current_id.is_empty() && !current_sequence.is_empty() {
-                // Store sequence in ordered vector, preserving original order
+                // 将序列存储在有序向量中，保持原始顺序
                 chrom_order.push((current_id.clone(), current_sequence.clone()));
             }
             
-            // Start new sequence
+            // 开始新序列
             let header = line.trim_start_matches('>');
             current_id = header.split_whitespace().next().unwrap_or(header).to_string();
             current_sequence = String::new();
         } else {
-            // Add sequence line (remove whitespace)
+            // 添加序列行（删除空格）
             current_sequence.push_str(line.trim());
         }
     }
     
-    // Add last sequence
+    // 添加最后一个序列
     if !current_id.is_empty() && !current_sequence.is_empty() {
         chrom_order.push((current_id, current_sequence));
     }
     
-    // Process sequences in original order
+    // 按原始顺序处理序列
     for (id, sequence) in chrom_order.iter() {
         eprintln!("Processing chromosome: {}, length: {}", id, sequence.len());
         process_chromosome(
@@ -602,9 +576,9 @@ fn main() -> Result<()> {
         )?;
     }
     
-    // All sequences have been processed in the loop above
+    // 上面的循环中已处理所有序列
 
-    // If GXF file is provided, process it
+    // 如果提供了GXF文件，处理它
     if let Some(gxf_file) = args.gtf {
         if !gxf_file.to_lowercase().ends_with(".gff") && 
            !gxf_file.to_lowercase().ends_with(".gff3") && 
@@ -621,81 +595,4 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Calculate the distance from a position to the nearest gene
-/// 
-/// This function finds the minimum distance from the given position to any gene on the chromosome
-/// Returns the distance in base pairs, or 0 if the position is within a gene
-/// Calculate the distance from a position to the nearest gene
-/// 
-/// This function finds the minimum distance from the given position to any gene boundary
-/// Returns usize::MAX if there are no genes on the chromosome
-/// Returns 0 if the position is within a gene
-fn find_distance_to_nearest_gene(pos: usize, chr: &str, gene_regions: &GeneRegions) -> usize {
-    if let Some(regions) = gene_regions.get(chr) {
-        if regions.is_empty() {
-            return usize::MAX; // No genes on this chromosome
-        }
-        
-        // Use binary search to find the nearest genes
-        match regions.binary_search_by_key(&pos, |r| r.start) {
-            Ok(_) => 0, // Position is exactly at a gene start
-            Err(i) => {
-                let mut min_distance = usize::MAX;
-                
-                // Check distance to previous gene (if exists)
-                if i > 0 {
-                    let prev_gene = &regions[i-1];
-                    if pos <= prev_gene.end {
-                        return 0; // Position is within the previous gene
-                    }
-                    min_distance = min_distance.min(pos - prev_gene.end);
-                }
-                
-                // Check distance to next gene (if exists)
-                if i < regions.len() {
-                    let next_gene = &regions[i];
-                    if pos >= next_gene.start && pos <= next_gene.end {
-                        return 0; // Position is within the next gene
-                    }
-                    min_distance = min_distance.min(next_gene.start.saturating_sub(pos));
-                }
-                
-                // Check additional nearby genes to ensure we find the truly closest one
-                // This handles cases where gene order might not perfectly correlate with position
-                let search_range = 5; // Check 5 genes in each direction
-                
-                // Check additional previous genes
-                for j in 2..=search_range {
-                    if i >= j {
-                        let prev_gene = &regions[i-j];
-                        if pos <= prev_gene.end {
-                            return 0; // Position is within this gene
-                        }
-                        min_distance = min_distance.min(pos - prev_gene.end);
-                    } else {
-                        break;
-                    }
-                }
-                
-                // Check additional next genes
-                for j in 1..search_range {
-                    if i+j < regions.len() {
-                        let next_gene = &regions[i+j];
-                        if pos >= next_gene.start && pos <= next_gene.end {
-                            return 0; // Position is within this gene
-                        }
-                        min_distance = min_distance.min(next_gene.start.saturating_sub(pos));
-                    } else {
-                        break;
-                    }
-                }
-                
-                min_distance
-            }
-        }
-    } else {
-        usize::MAX // No genes on this chromosome
-    }
 }
