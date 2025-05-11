@@ -169,34 +169,102 @@ pub fn find_nearest_intergenic_region(
 ) -> Option<usize> {
     if let Some(regions) = gene_regions.get(chr) {
         if regions.is_empty() {
-            return Some(pos); // If there are no genes, the current position is an intergenic region
+            return Some(pos); // 如果没有基因，当前位置就是基因间区域
         }
         
-        // If the current position is already an intergenic region, return it directly
+        // 如果当前位置已经是基因间区域，找到它所在的区间并返回中点
         if is_in_intergenic(pos, chr, gene_regions) {
-            return Some(pos);
+            // 找到当前位置所在的基因间区域
+            if pos < regions[0].start {
+                // 在第一个基因之前
+                return Some(pos.min(regions[0].start / 2)); // 取当前位置和第一个基因起始位置一半的较小值
+            } else if pos > regions.last().unwrap().end {
+                // 在最后一个基因之后
+                return Some(pos); // 保持原位置
+            } else {
+                // 在两个基因之间
+                for i in 0..regions.len() - 1 {
+                    if pos > regions[i].end && pos < regions[i + 1].start {
+                        // 计算两个基因之间的中点
+                        return Some(regions[i].end + (regions[i + 1].start - regions[i].end) / 2);
+                    }
+                }
+            }
+            return Some(pos); // 默认返回原位置
         }
         
-        // Search forward and backward
+        // 搜索前后最近的基因间区域
+        let mut best_pos = None;
+        let mut min_distance = max_search_distance + 1;
+        
+        // 搜索前后
         for offset in 1..=max_search_distance {
-            // Search backward
+            // 向前搜索
             if pos > offset {
                 let backward_pos = pos - offset;
                 if is_in_intergenic(backward_pos, chr, gene_regions) {
-                    return Some(backward_pos);
+                    // 找到向前的基因间区域
+                    for i in 0..regions.len() - 1 {
+                        if backward_pos > regions[i].end && backward_pos < regions[i + 1].start {
+                            // 计算两个基因之间的中点
+                            let midpoint = regions[i].end + (regions[i + 1].start - regions[i].end) / 2;
+                            if offset < min_distance {
+                                best_pos = Some(midpoint);
+                                min_distance = offset;
+                            }
+                            break;
+                        }
+                    }
+                    // 如果在第一个基因之前
+                    if backward_pos < regions[0].start && offset < min_distance {
+                        best_pos = Some(backward_pos.min(regions[0].start / 2));
+                        min_distance = offset;
+                    }
+                    // 如果在最后一个基因之后
+                    if backward_pos > regions.last().unwrap().end && offset < min_distance {
+                        best_pos = Some(backward_pos);
+                        min_distance = offset;
+                    }
+                    if best_pos.is_some() {
+                        break;
+                    }
                 }
             }
             
-            // Search forward
+            // 向后搜索
             let forward_pos = pos + offset;
             if is_in_intergenic(forward_pos, chr, gene_regions) {
-                return Some(forward_pos);
+                // 找到向后的基因间区域
+                for i in 0..regions.len() - 1 {
+                    if forward_pos > regions[i].end && forward_pos < regions[i + 1].start {
+                        // 计算两个基因之间的中点
+                        let midpoint = regions[i].end + (regions[i + 1].start - regions[i].end) / 2;
+                        if offset < min_distance {
+                            best_pos = Some(midpoint);
+                            min_distance = offset;
+                        }
+                        break;
+                    }
+                }
+                // 如果在第一个基因之前
+                if forward_pos < regions[0].start && offset < min_distance {
+                    best_pos = Some(forward_pos.min(regions[0].start / 2));
+                    min_distance = offset;
+                }
+                // 如果在最后一个基因之后
+                if forward_pos > regions.last().unwrap().end && offset < min_distance {
+                    best_pos = Some(forward_pos);
+                    min_distance = offset;
+                }
+                if best_pos.is_some() {
+                    break;
+                }
             }
         }
+        
+        return best_pos;
     } else {
-        // If the chromosome has no gene annotations, all positions are intergenic regions
+        // 如果染色体没有基因注释，所有位置都是基因间区域
         return Some(pos);
     }
-    
-    None // No suitable intergenic region found
-} 
+}
