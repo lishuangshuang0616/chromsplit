@@ -26,7 +26,7 @@ Ensure you have the [Rust toolchain](https://rustup.rs/) installed via `rustup`.
 Clone the repository and compile in release mode to enable maximum compiler optimizations (LTO, Single Codegen unit).
 
 ```bash
-git clone https://github.com/your-org/chromsplit.git
+git clone https://github.com/lishuangshuang0616/chromsplit.git
 cd chromsplit
 cargo build --release
 ```
