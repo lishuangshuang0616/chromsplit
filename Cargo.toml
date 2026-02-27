@@ -1,6 +1,7 @@
 [package]
 name = "chromsplit"
-version = "0.1.0"
+version = "1.0.0"
+authors = ["lishuangshuang<[lishuangshuang3@mgi-tech.com]>"]
 edition = "2021"
 
 [dependencies]
@@ -9,3 +10,9 @@ regex = "1.10.3"
 anyhow = "1.0.79"
 bio = "1.5.0"
 lazy_static = "1.4.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
